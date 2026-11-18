@@ -1,0 +1,106 @@
+# Agent-Scale Memory: Applying the Scion Principles to claude-mem
+
+**Date:** 2026-11-18
+**Status:** Proposed. Phase 1 is ready to build; Phases 2–5 need sign-off on scope.
+**Source:** Anthropic's write-up on Scion, the in-house source control system it built after merges went from ~2,500/day to 30,000+/day. Scion's lesson is that tools sized for humans break once agents become most of the clients, and that the fix is to design for clients that are *always online, numerous, and short-lived*.
+
+claude-mem is heading into the same pattern. Memory writes used to come from one person at one terminal. They now come from agents running in parallel, cloud sandboxes (Claude Code on the web, Claude Tag, CI), and up to 64 devices per account. Every one of those is online, and most are ephemeral. This plan maps each Scion principle onto what claude-mem already has, names the gaps, and orders the work.
+
+---
+
+## 1. Where we already match Scion
+
+Most of the data model is already right. That should stay, not be rebuilt.
+
+| Scion principle | claude-mem today | Anchor |
+|---|---|---|
+| Unit of work is an append-only changeset in a write-ahead log | SyncHub is a per-user ordered op log with a monotonic `seq` and cursor pulls | `services/sync-api/src/store.ts`, `docs/public/cloud-sync.mdx` |
+| Content-addressed, immutable data that any tier can cache | Observations dedupe on content hash; canonical bodies are content-hashed | `src/services/sync/CanonicalContent.ts`, `storeObservations` `ON CONFLICT DO NOTHING` |
+| No refs to coordinate; writes don't move global pointers | Idempotent push keyed on origin identity; no global branch state | `pushOps` in `store.ts` |
+| Durable truth over HTTP; anything faster is advisory | Two-lane sync: HTTP cursor is the truth, the WebSocket only nudges | `plans/2026-07-17-phase5-two-lane-sync.md` |
+| Server-side query API | Recall MCP server: `search`, `timeline`, `get_observations`, `context`, `recent` | `src/server/mcp/recall-mcp-server.ts` |
+| Hosting off metered compute | Hub runs on Fly + Neon, not Cloudflare | `services/sync-api/fly.toml` |
+
+## 2. Gaps, ranked by leverage
+
+### Gap A: a push can't succeed until projection catches up (the biggest one)
+
+Scion requires that *"the cost of creating a commit… scale with the size of the change, not the overall size of the repo,"* and it computes everything downstream as **derived data**, eagerly or deferred, apart from the write.
+
+Our hub ties the two together. `POST /v1/sync/push` writes the ops durably, then **awaits `drainProjection`** before replying (`services/sync-api/src/index.ts:185-208`). When projection is behind or leased by another request, the client gets a `503` (`projection_catching_up` / `projection_busy`) even though the response says `durable: true`. The rest of the system has bent around this:
+
+- Client batch size was cut from 200 to **40** because pushes timed out under `projection_busy` (`src/services/sync/CloudSync.ts:70-73`).
+- Client request timeout was raised to **90 s** to outlast the projection lease (`CloudSync.ts:74-78`).
+- The client keeps rows in the outbox until *projection* acknowledges them, so data that is already durable gets re-sent (`CloudSync.ts:1118-1121`).
+
+The cost of a write therefore grows with the projection backlog, and every new agent adds to that backlog. This is the human-scale assumption that will break first.
+
+### Gap B: each index is built its own way
+
+FTS (SQLite triggers), Chroma embeddings (`ChromaSync` + `ChromaSyncState`), hub projection, session summaries, and the context cache each have their own pipeline, retry state, and catch-up logic. Scion uses **one generic mechanism**: each kind of derived data is defined from its parents, and each is marked eager or lazy. Adding a new index (copy detection, path search) then costs one definition, not a new pipeline.
+
+### Gap C: cloud and ephemeral agents pay for a full local install
+
+Scion's clients keep a bounded cache and ask the server for everything else, and *"the working copy is optional, and sparse by design."* A claude-mem client is a full peer: Bun worker, SQLite, a Chroma sidecar (via `uv`/Python), plus a pull of the whole history. That is reasonable for a laptop and wasteful for a sandbox that lives for 20 minutes. The recall MCP server and `src/server` already cover most of the read path; nothing sets up a client that *only* uses them.
+
+### Gap D: missing queries that agents need
+
+Scion's server answers blame and path history, so tools never need a local copy. The memory equivalent is "**which observations touched this file / this symbol, newest first**" (memory blame). `files_read`/`files_modified` are stored per observation, but the recall API has no path-history query. Today an agent would have to search text and filter the results itself, which is the same "linearly read the commit log" anti-pattern the Scion team kept stopping Claude from writing.
+
+### Gap E: the fleet is watched by alerts, not watchers
+
+Scion's "superfans" are agents, each assigned to the health of one component. We already expose `/api/sync/status`, queue-health types, and PostHog telemetry. Nothing watches them continuously.
+
+---
+
+## 3. Phased plan
+
+### Phase 1: Separate push acceptance from projection *(ready to build, ~1–2 PRs)*
+
+Goal: a push costs O(ops in the request) and returns `200` as soon as the ops are durable.
+
+1. **Hub** (`services/sync-api/src/index.ts`): after `pushOps` succeeds, return `200 { head_seq, projected_seq, durable: true }` straight away. Start projection with a non-blocking kick (an in-process `user-queue.ts` job), not an `await`. Keep the lease and checkpoint code in `projection.ts` as it is; only the caller changes.
+2. **Protocol:** add `projection_pending: boolean` to the push response so clients and `/v1/sync/status` can still report lag. Pulls already read `projected_seq`, so readers keep their guarantee.
+3. **Client** (`CloudSync.ts`): mark outbox rows synced on `durable: true`, not on projection. Then re-test whether the batch size can go back up toward 200–500 and the timeout back down to ~30 s (measure first; don't just flip the constants).
+4. **Tests:** extend `services/sync-api/test/lock-hold.test.ts` with a case where a slow projector must not slow pushes, and add a client test where a durable push with projection pending does not retry.
+5. **Backward compatibility:** older clients that treat `503 durable:true` as retryable still converge, because push is idempotent. Nothing has to ship in lockstep.
+
+**Exit criteria:** p99 push latency doesn't change as projection backlog grows; no `projection_busy` errors in client logs; outbox drains in one pass after an offline week.
+
+### Phase 2: One registry for derived data *(design doc, then incremental)*
+
+Define a `DerivedDataKind` interface: `{ name, version, deps, mode: 'eager' | 'lazy', compute(row, parents) }`, with one watermark table (`derived_watermarks(kind, version, last_seq)`). Move the existing pipelines onto it one at a time, lowest risk first:
+
+1. Chroma embeddings (replaces most of `ChromaSyncState`)
+2. Hub projection
+3. Context cache / session rollups
+4. FTS stays on triggers. It is already synchronous and cheap, so moving it gains nothing.
+
+Raising a kind's `version` triggers a background backfill instead of a hand-written migration (compare the existing one-off `requeue*` migrations in `SessionStore.ts`).
+
+### Phase 3: Memory blame and path history *(1 PR once Phase 2 lands, or now as a plain query)*
+
+Add `history(path, { project, limit, since })` to the recall MCP server and the worker HTTP API. It returns observations whose `files_read`/`files_modified` include the path, newest first. Back it with a `observation_paths(observation_id, path, kind)` index, which is the first new derived kind under Phase 2. This gives agents a cheap "what do we already know about this file?" call before they edit it.
+
+### Phase 4: A thin client for ephemeral agents *(spike first)*
+
+Add an install mode (`CLAUDE_MEM_MODE=remote`) with no local Chroma and no full pull. Hooks POST events to the hosted server, and context injection calls the server's `context` endpoint. The only local state is a bounded, content-addressed cache of recently read observations. The spike should answer three questions: cold-start time, what happens when the server can't be reached (degrade to no injected context, never block the session), and auth for a sandbox that has no browser.
+
+### Phase 5: Superfans for claude-mem's own fleet *(ops, no product code)*
+
+Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each posts a short daily note and escalates anomalies. This uses existing endpoints only.
+
+---
+
+## 4. Things we deliberately won't copy
+
+- **Not a new storage engine.** Scion replaced git because of 100 GB histories. A user's memory log is small. We are adopting the *shape* (log + derived data + thin clients), not a rewrite.
+- **No Spanner or global-consensus layer.** Per-user logs on Postgres with an advisory lock are the right size for this. Keep refs and global state out of the write path, as we already do.
+- **No adversarial over-hardening.** The write-up warns that adversarial review "can also be myopic." Phase 1 should trust the hub's own durability guarantee instead of layering validation on top of it.
+- **No Cloudflare compute.** All new server-side work stays on Fly/Vercel, per `CLAUDE.md`.
+
+## 5. Open questions for the owner
+
+1. Is Phase 4 (a thin remote client) wanted for the open-source plugin, or only for CMEM Pro?
+2. Should the hub's projection worker run in-process on Fly (simplest) or as a separate Fly machine (isolates failures, as Scion separates its tiers)?
+3. Who receives the Phase 5 watcher reports: a Slack channel, a GitHub issue, or email?
