@@ -88,7 +88,7 @@ Add an install mode (`CLAUDE_MEM_MODE=remote`) with no local Chroma and no full 
 
 ### Phase 5: Superfans for claude-mem's own fleet *(ops, no product code)*
 
-Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports through a GitHub issue labelled `watcher` and assigned to Sid (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
+Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports to Sid through a GitHub issue labelled `watcher` on this repo (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
 
 ---
 
@@ -103,4 +103,8 @@ Set up scheduled Claude sessions, each owning one component: **sync-api hub** (h
 
 1. **Thin client ships in the open-source plugin.** `CLAUDE_MEM_MODE=remote` is a normal install mode, not a Pro-only feature. It must work against any compatible server, both self-hosted `src/server` and the hosted one, so the server URL and auth are settings rather than hard-coded cmem.ai values. Pro adds the hosted endpoint only.
 2. **Background projection runs inside the existing `cmem-sync-api` Fly app.** No new machine or process group. Phase 1 kicks projection through the in-process `user-queue.ts` and keeps the existing Postgres lease, so a second machine of the same app can't project the same user at the same time. If projection load later starts to affect push latency, the fallback is a separate Fly process group in the same app, not a new app.
-3. **Watchers report through GitHub issues.** Each watcher opens or updates one issue per component, labelled `watcher` plus a component label (`watcher:sync-hub`, `watcher:observer-queue`, `watcher:install-health`), and assigns it to Sid. It updates the existing open issue for a component instead of opening duplicates, and closes it when the signal clears. No Slack channel and no email for now.
+3. **Watchers report to Sid through GitHub issues.** Sid is the lead bot for the agents in the UP Command Center artifact and has no GitHub account, so the issues live on this repo under the owner's account:
+   - Each watcher opens or updates one issue per component, labelled `watcher` plus a component label (`watcher:sync-hub`, `watcher:observer-queue`, `watcher:install-health`), and assigned to the repo owner.
+   - It comments on the component's existing open issue instead of opening duplicates, and closes the issue when the signal clears.
+   - Sid reads open `watcher` issues as its input. A later step adds a "Watcher issues" panel to the UP Command Center that lists them, so the owner sees the same queue Sid works from. GitHub stays the single record.
+   - No Slack channel and no email for now.
