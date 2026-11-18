@@ -1,7 +1,7 @@
 # Agent-Scale Memory: Applying the Scion Principles to claude-mem
 
 **Date:** 2026-11-18
-**Status:** Proposed. Phase 1 is ready to build; Phases 2–5 need sign-off on scope.
+**Status:** Proposed. Owner decisions recorded in §5. Phase 1 is ready to build.
 **Source:** Anthropic's write-up on Scion, the in-house source control system it built after merges went from ~2,500/day to 30,000+/day. Scion's lesson is that tools sized for humans break once agents become most of the clients, and that the fix is to design for clients that are *always online, numerous, and short-lived*.
 
 claude-mem is heading into the same pattern. Memory writes used to come from one person at one terminal. They now come from agents running in parallel, cloud sandboxes (Claude Code on the web, Claude Tag, CI), and up to 64 devices per account. Every one of those is online, and most are ephemeral. This plan maps each Scion principle onto what claude-mem already has, names the gaps, and orders the work.
@@ -88,7 +88,7 @@ Add an install mode (`CLAUDE_MEM_MODE=remote`) with no local Chroma and no full 
 
 ### Phase 5: Superfans for claude-mem's own fleet *(ops, no product code)*
 
-Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each posts a short daily note and escalates anomalies. This uses existing endpoints only.
+Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports through a GitHub issue labelled `watcher` and assigned to Sid (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
 
 ---
 
@@ -99,8 +99,8 @@ Set up scheduled Claude sessions, each owning one component: **sync-api hub** (h
 - **No adversarial over-hardening.** The write-up warns that adversarial review "can also be myopic." Phase 1 should trust the hub's own durability guarantee instead of layering validation on top of it.
 - **No Cloudflare compute.** All new server-side work stays on Fly/Vercel, per `CLAUDE.md`.
 
-## 5. Open questions for the owner
+## 5. Owner decisions (2026-11-18)
 
-1. Is Phase 4 (a thin remote client) wanted for the open-source plugin, or only for CMEM Pro?
-2. Should the hub's projection worker run in-process on Fly (simplest) or as a separate Fly machine (isolates failures, as Scion separates its tiers)?
-3. Who receives the Phase 5 watcher reports: a Slack channel, a GitHub issue, or email?
+1. **Thin client ships in the open-source plugin.** `CLAUDE_MEM_MODE=remote` is a normal install mode, not a Pro-only feature. It must work against any compatible server, both self-hosted `src/server` and the hosted one, so the server URL and auth are settings rather than hard-coded cmem.ai values. Pro adds the hosted endpoint only.
+2. **Background projection runs inside the existing `cmem-sync-api` Fly app.** No new machine or process group. Phase 1 kicks projection through the in-process `user-queue.ts` and keeps the existing Postgres lease, so a second machine of the same app can't project the same user at the same time. If projection load later starts to affect push latency, the fallback is a separate Fly process group in the same app, not a new app.
+3. **Watchers report through GitHub issues.** Each watcher opens or updates one issue per component, labelled `watcher` plus a component label (`watcher:sync-hub`, `watcher:observer-queue`, `watcher:install-health`), and assigns it to Sid. It updates the existing open issue for a component instead of opening duplicates, and closes it when the signal clears. No Slack channel and no email for now.
