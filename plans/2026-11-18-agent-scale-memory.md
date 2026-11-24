@@ -1,7 +1,7 @@
 # Agent-Scale Memory: Applying the Scion Principles to claude-mem
 
 **Date:** 2026-11-18
-**Status:** Proposed. Owner decisions recorded in §5. Phase 1 is ready to build.
+**Status:** Proposed. Owner decisions recorded in §5. **Phase 1 withdrawn 2026-11-24** (see the correction under Gap A); Phase 3 is the next buildable step.
 **Source:** Anthropic's write-up on Scion, the in-house source control system it built after merges went from ~2,500/day to 30,000+/day. Scion's lesson is that tools sized for humans break once agents become most of the clients, and that the fix is to design for clients that are *always online, numerous, and short-lived*.
 
 claude-mem is heading into the same pattern. Memory writes used to come from one person at one terminal. They now come from agents running in parallel, cloud sandboxes (Claude Code on the web, Claude Tag, CI), and up to 64 devices per account. Every one of those is online, and most are ephemeral. This plan maps each Scion principle onto what claude-mem already has, names the gaps, and orders the work.
@@ -19,11 +19,14 @@ Most of the data model is already right. That should stay, not be rebuilt.
 | No refs to coordinate; writes don't move global pointers | Idempotent push keyed on origin identity; no global branch state | `pushOps` in `store.ts` |
 | Durable truth over HTTP; anything faster is advisory | Two-lane sync: HTTP cursor is the truth, the WebSocket only nudges | `plans/2026-07-17-phase5-two-lane-sync.md` |
 | Server-side query API | Recall MCP server: `search`, `timeline`, `get_observations`, `context`, `recent` | `src/server/mcp/recall-mcp-server.ts` |
-| Hosting off metered compute | Hub runs on Fly + Neon, not Cloudflare | `services/sync-api/fly.toml` |
+| Hosting off metered compute | `sync.cmem.ai` runs on Fly and forwards to the Supabase `cmem-sync` function; nothing on Cloudflare compute | `services/sync-api/fly.toml`, `services/sync-api/src/forward.ts` |
 
 ## 2. Gaps, ranked by leverage
 
-### Gap A: a push can't succeed until projection catches up (the biggest one)
+### Gap A: a push can't succeed until projection catches up (withdrawn; already fixed by the Supabase cutover)
+
+> **Correction, 2026-11-24.** This gap was written from the Fly hub's code without checking which mode production runs in. Production `sync.cmem.ai` runs in **forward mode**: `GET /v1/sync/ws` answers `410 {"error":"websocket_retired"}`, a response only `services/sync-api/src/forward.ts` produces. Every `/v1/sync/*` request goes to the Supabase `cmem-sync` function, which appends to the log and writes the searchable rows in one transaction, so `projected_seq == head_seq` always (`plans/2026-10-03-liveness-over-deadlines.md`, Track B). The hub-mode `drainProjection` path described below serves no traffic, and Phase 12 step 8 of that plan deletes it. Phase 1 is withdrawn. What still applies is in the follow-ups at the end of Phase 1.
+
 
 Scion requires that *"the cost of creating a commit… scale with the size of the change, not the overall size of the repo,"* and it computes everything downstream as **derived data**, eagerly or deferred, apart from the write.
 
@@ -55,7 +58,7 @@ Scion's "superfans" are agents, each assigned to the health of one component. We
 
 ## 3. Phased plan
 
-### Phase 1: Separate push acceptance from projection *(ready to build, ~1–2 PRs)*
+### Phase 1: Separate push acceptance from projection *(withdrawn; see the correction under Gap A)*
 
 Goal: a push costs O(ops in the request) and returns `200` as soon as the ops are durable.
 
@@ -67,13 +70,18 @@ Goal: a push costs O(ops in the request) and returns `200` as soon as the ops ar
 
 **Exit criteria:** p99 push latency doesn't change as projection backlog grows; no `projection_busy` errors in client logs; outbox drains in one pass after an offline week.
 
+**What survives the withdrawal:**
+- The client's batch size (40) and request timeout (90 s) were tuned for the Fly hub's `projection_busy` (`CloudSync.ts:70-78`). With the Supabase function they may be too conservative. Measure push latency against production before changing either.
+- Whether a Supabase push still costs O(change) depends on the `cmem-sync` function, which lives in the claude-mem-pro repo, not here. Review it there.
+- `docs/public/cloud-sync.mdx` still says the hub's source is `services/sync-api/`. It should name the Supabase function.
+
 ### Phase 2: One registry for derived data *(design doc, then incremental)*
 
 Define a `DerivedDataKind` interface: `{ name, version, deps, mode: 'eager' | 'lazy', compute(row, parents) }`, with one watermark table (`derived_watermarks(kind, version, last_seq)`). Move the existing pipelines onto it one at a time, lowest risk first:
 
 1. Chroma embeddings (replaces most of `ChromaSyncState`)
-2. Hub projection
-3. Context cache / session rollups
+2. Context cache / session rollups
+3. (Hub projection is no longer a candidate: since the Supabase cutover it happens inside the push transaction.)
 4. FTS stays on triggers. It is already synchronous and cheap, so moving it gains nothing.
 
 Raising a kind's `version` triggers a background backfill instead of a hand-written migration (compare the existing one-off `requeue*` migrations in `SessionStore.ts`).
@@ -88,7 +96,7 @@ Add an install mode (`CLAUDE_MEM_MODE=remote`) with no local Chroma and no full 
 
 ### Phase 5: Superfans for claude-mem's own fleet *(ops, no product code)*
 
-Set up scheduled Claude sessions, each owning one component: **sync-api hub** (head/projected lag, 409 rates, lease contention), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports to Sid through a GitHub issue labelled `watcher` on this repo (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
+Set up scheduled Claude sessions, each owning one component: **sync hub** (the Fly forwarder's upstream errors and the Supabase function's push latency and 409 rates), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports to Sid through a GitHub issue labelled `watcher` on this repo (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
 
 ---
 
