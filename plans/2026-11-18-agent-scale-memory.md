@@ -1,7 +1,7 @@
 # Agent-Scale Memory: Applying the Scion Principles to claude-mem
 
 **Date:** 2026-11-18
-**Status:** Proposed. Owner decisions recorded in §5. **Phase 1 withdrawn 2026-11-24** (see the correction under Gap A); Phase 3 is the next buildable step.
+**Status:** Proposed. Owner decisions recorded in §5. **Phase 1 withdrawn 2026-11-24** (see the correction under Gap A). **Phase 3 done 2026-11-25** (it was mostly built already; this PR exposes it to agents).
 **Source:** Anthropic's write-up on Scion, the in-house source control system it built after merges went from ~2,500/day to 30,000+/day. Scion's lesson is that tools sized for humans break once agents become most of the clients, and that the fix is to design for clients that are *always online, numerous, and short-lived*.
 
 claude-mem is heading into the same pattern. Memory writes used to come from one person at one terminal. They now come from agents running in parallel, cloud sandboxes (Claude Code on the web, Claude Tag, CI), and up to 64 devices per account. Every one of those is online, and most are ephemeral. This plan maps each Scion principle onto what claude-mem already has, names the gaps, and orders the work.
@@ -46,9 +46,9 @@ FTS (SQLite triggers), Chroma embeddings (`ChromaSync` + `ChromaSyncState`), hub
 
 Scion's clients keep a bounded cache and ask the server for everything else, and *"the working copy is optional, and sparse by design."* A claude-mem client is a full peer: Bun worker, SQLite, a Chroma sidecar (via `uv`/Python), plus a pull of the whole history. That is reasonable for a laptop and wasteful for a sandbox that lives for 20 minutes. The recall MCP server and `src/server` already cover most of the read path; nothing sets up a client that *only* uses them.
 
-### Gap D: missing queries that agents need
+### Gap D: missing queries that agents need *(mostly not a gap; see Phase 3)*
 
-Scion's server answers blame and path history, so tools never need a local copy. The memory equivalent is "**which observations touched this file / this symbol, newest first**" (memory blame). `files_read`/`files_modified` are stored per observation, but the recall API has no path-history query. Today an agent would have to search text and filter the results itself, which is the same "linearly read the commit log" anti-pattern the Scion team kept stopping Claude from writing.
+Scion's server answers blame and path history, so tools never need a local copy. The memory equivalent is "**which observations touched this file / this symbol, newest first**" (memory blame). The first draft said the recall API had no path-history query. In fact the local worker already had one (an indexed table, a by-file route, a `files` search filter and the File Read Gate). Only the MCP tool schema hid it. The hosted server's recall MCP still has no path filter.
 
 ### Gap E: the fleet is watched by alerts, not watchers
 
@@ -86,9 +86,19 @@ Define a `DerivedDataKind` interface: `{ name, version, deps, mode: 'eager' | 'l
 
 Raising a kind's `version` triggers a background backfill instead of a hand-written migration (compare the existing one-off `requeue*` migrations in `SessionStore.ts`).
 
-### Phase 3: Memory blame and path history *(1 PR once Phase 2 lands, or now as a plain query)*
+### Phase 3: Memory blame and path history *(done 2026-11-25; most of it already existed)*
 
-Add `history(path, { project, limit, since })` to the recall MCP server and the worker HTTP API. It returns observations whose `files_read`/`files_modified` include the path, newest first. Back it with a `observation_paths(observation_id, path, kind)` index, which is the first new derived kind under Phase 2. This gives agents a cheap "what do we already know about this file?" call before they edit it.
+Most of this was already built when the plan was written; Gap D overstated it:
+- `observation_files` already indexes one row per path an observation reads or modifies (written via `src/services/sqlite/observations/files.ts`, read by `getObservationsByFilePath` in `observations/get.ts`).
+- `/api/search/by-file` and the `files` filter on `/api/search` already return a path's memories newest first, including filter-only searches with no query.
+- The File Read Gate already shows a file's memory timeline automatically when Claude Code reads a supported code file that has history (`docs/public/file-read-gate.mdx`).
+
+What was missing, and is fixed in this PR:
+- The MCP `search` tool passed `files` through but never declared it, so agents had no way to know about it. It is now in the schema and description, with a test.
+- In server runtime, `search` sent `files` to the server, which ignored it and returned unfiltered results. It is now refused with the same "unsupported local filters" error as `project` and `obs_type`, with a test that fails without the fix.
+- `docs/public/usage/search-tools.mdx` documents `files` and adds a "Before Changing a File" workflow.
+
+Not done, and worth a separate look: the `files` filter matches substrings (`LIKE %path%`), so `index.ts` matches every `index.ts`. The `observation_files` index supports exact matching; switching the `search` filter to it would be more precise and faster on large databases.
 
 ### Phase 4: A thin client for ephemeral agents *(spike first)*
 

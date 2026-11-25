@@ -15,6 +15,7 @@ type ListedTool = { name: string; inputSchema: { properties?: Record<string, unk
 async function withServer(
   runtime: 'worker' | 'server',
   run: (client: Client, workerRequests: Array<{ path: string; body: any; query: any }>, cwd: string) => Promise<void>,
+  extraEnv: Record<string, string> = {},
 ): Promise<void> {
   const workerRequests: Array<{ path: string; body: any; query: any }> = [];
   const app = express();
@@ -43,6 +44,7 @@ async function withServer(
       CLAUDE_MEM_RUNTIME: runtime,
       CLAUDE_MEM_SERVER_URL: `http://127.0.0.1:${port}`,
       CLAUDE_MEM_SERVER_API_KEY: 'schema-fixture-key',
+      ...extraEnv,
     } as Record<string, string>,
   });
   const client = new Client({ name: 'tool-schema-fixture', version: '1' });
@@ -71,7 +73,7 @@ describe('MCP tool inputSchema declarations', () => {
   const required = (name: string) => tools.get(name)?.inputSchema.required ?? [];
 
   it.each([
-    ['search', ['query', 'limit', 'project', 'orderBy']],
+    ['search', ['query', 'files', 'limit', 'project', 'orderBy']],
     ['timeline', ['anchor', 'query', 'depth_before', 'depth_after', 'project']],
     ['get_observations', ['ids']],
     ['session_start_context', ['project', 'projects', 'platformSource', 'full', 'colors']],
@@ -111,6 +113,27 @@ describe('work_state tools', () => {
       expect(write?.body.cwd).toBe(cwd);
       expect(read?.query.cwd).toBe(cwd);
     });
+  }, 30_000);
+});
+
+describe('search by file', () => {
+  it('forwards files to the worker search route without a query', async () => {
+    await withServer('worker', async (client, workerRequests) => {
+      await client.callTool({ name: 'search', arguments: { files: 'src/services/sync/CloudSync.ts' } });
+      const search = workerRequests.find(request => request.path === '/api/search');
+      expect(search?.query.files).toBe('src/services/sync/CloudSync.ts');
+      expect(search?.query.query).toBeUndefined();
+    });
+  }, 30_000);
+
+  it('refuses files in server runtime instead of returning unfiltered results', async () => {
+    await withServer('server', async (client, workerRequests) => {
+      const before = workerRequests.length;
+      const result = await client.callTool({ name: 'search', arguments: { query: 'sync', files: 'src/a.ts' } }) as { isError?: boolean; content: Array<{ text?: string }> };
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain('Remove unsupported local filters');
+      expect(workerRequests.length).toBe(before);
+    }, { CLAUDE_MEM_SERVER_PROJECT_ID: 'schema-fixture-project' });
   }, 30_000);
 });
 
