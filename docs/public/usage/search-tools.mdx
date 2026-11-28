@@ -100,6 +100,7 @@ Search your memory and get a compact index with IDs.
 
 **Parameters:**
 - `query` - What to look for, in plain words: matched by meaning first, then by keywords (see [How the query is matched](#how-the-query-is-matched))
+- `files` - Only memories that read or modified a matching path; comma-separated for several. A path matches when it contains the value, so `index.ts` also matches every other `index.ts`: pass a full or repo-relative path. Works without `query`, which lists a file's history newest first. Not available when claude-mem runs against a remote server (`CLAUDE_MEM_RUNTIME=server`); the tool returns an error instead of ignoring it.
 - `limit` - Maximum results (default: 20)
 - `offset` - Skip first N results for pagination
 - `type` - Record category: `observations`, `sessions` or `prompts` (default: all). Any other value is treated as an observation type, like `obs_type`
@@ -243,6 +244,20 @@ Step 2: timeline(anchor=<interesting_id>, depth_before=3, depth_after=3)
 Step 3: get_observations(ids=[<selected_ids>])
   → Study the selected patterns and approaches
 ```
+
+### Before Changing a File
+
+**Scenario:** Check what memory already knows about a file before editing it
+
+```
+Step 1: search(files="src/services/sync/CloudSync.ts", limit=10)
+  → Every memory that read or modified the file, newest first
+
+Step 2: get_observations(ids=[<relevant_ids>])
+  → Past decisions, bugs and constraints for that file
+```
+
+The [File Read Gate](/file-read-gate) already shows this history automatically when Claude Code reads a supported code file that has memories. Use `search` with `files` for any other file, or when an agent wants the history without reading the file.
 
 ### Context Recovery
 

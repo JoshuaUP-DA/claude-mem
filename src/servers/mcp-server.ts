@@ -619,11 +619,12 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
   },
   {
     name: 'search',
-    description: 'Smart search (default), step 1: search memory for an index with IDs. Review it, use timeline for context, then get_observations only for selected IDs. Params: query, limit, project, platformSource, type, obs_type, dateStart, dateEnd, offset, orderBy',
+    description: 'Smart search (default), step 1: search memory for an index with IDs. Review it, use timeline for context, then get_observations only for selected IDs. To see what memory already knows about a file before changing it, pass files with no query: it lists the memories that read or modified that path, newest first. Params: query, files, limit, project, platformSource, type, obs_type, dateStart, dateEnd, offset, orderBy',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Search query' },
+        files: { type: 'string', description: 'Only memories that read or modified a matching path (substring match, so prefer a full or repo-relative path). Comma-separated for several. Can be used without query.' },
         limit: { type: 'number', description: 'Max results (default 20)' },
         project: { type: 'string', description: 'Worker project name' },
         projectId: { type: 'string', description: 'Server project ID; defaults to the configured server project' },
@@ -641,7 +642,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
     handler: async (args: any) => {
       if (selectRuntime() === 'server') {
         const ctx = requireServerForObservationTool('search');
-        const unsupported = ['project', 'obs_type', 'dateStart', 'dateEnd', 'offset', 'orderBy']
+        const unsupported = ['project', 'files', 'obs_type', 'dateStart', 'dateEnd', 'offset', 'orderBy']
           .filter(key => args?.[key] !== undefined);
         if (unsupported.length || (args?.type !== undefined && args.type !== 'observations')) {
           return mcpTextResult('Server search supports query, projectId, limit, and platformSource. Remove unsupported local filters; this request was not sent to the local worker.', true);
