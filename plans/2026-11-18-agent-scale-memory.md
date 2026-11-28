@@ -1,7 +1,7 @@
 # Agent-Scale Memory: Applying the Scion Principles to claude-mem
 
 **Date:** 2026-11-18
-**Status:** Proposed. Owner decisions recorded in §5. **Phase 1 withdrawn 2026-11-24** (see the correction under Gap A). **Phase 3 done 2026-11-25** (it was mostly built already; this PR exposes it to agents).
+**Status:** Proposed. Owner decisions recorded in §5. **Phase 1 withdrawn 2026-11-24** (see the correction under Gap A). **Phase 3 done 2026-11-25** (it was mostly built already; this PR exposes it to agents). **2026-11-28:** Phase 2 is a design for upstream, Phase 4 already exists, Phase 5 is an upstream drift watcher. See §6 for what changed: this repo is a fork of `thedotmack/claude-mem` and is 46 releases behind it.
 **Source:** Anthropic's write-up on Scion, the in-house source control system it built after merges went from ~2,500/day to 30,000+/day. Scion's lesson is that tools sized for humans break once agents become most of the clients, and that the fix is to design for clients that are *always online, numerous, and short-lived*.
 
 claude-mem is heading into the same pattern. Memory writes used to come from one person at one terminal. They now come from agents running in parallel, cloud sandboxes (Claude Code on the web, Claude Tag, CI), and up to 64 devices per account. Every one of those is online, and most are ephemeral. This plan maps each Scion principle onto what claude-mem already has, names the gaps, and orders the work.
@@ -75,16 +75,11 @@ Goal: a push costs O(ops in the request) and returns `200` as soon as the ops ar
 - Whether a Supabase push still costs O(change) depends on the `cmem-sync` function, which lives in the claude-mem-pro repo, not here. Review it there.
 - `docs/public/cloud-sync.mdx` still says the hub's source is `services/sync-api/`. It should name the Supabase function.
 
-### Phase 2: One registry for derived data *(design doc, then incremental)*
+### Phase 2: One registry for derived data *(design written 2026-11-28; to propose upstream, not built here)*
 
-Define a `DerivedDataKind` interface: `{ name, version, deps, mode: 'eager' | 'lazy', compute(row, parents) }`, with one watermark table (`derived_watermarks(kind, version, last_seq)`). Move the existing pipelines onto it one at a time, lowest risk first:
+Design: `plans/2026-11-28-derived-data-registry.md`, written against upstream v17.0.2. In short, only the Chroma embeddings index can fall behind, and its progress lives in a JSON file that has needed its own backoff, coalescing and retry fixes. The design moves that progress into SQLite tables with a version per index, so a format change rebuilds by bumping a number. It adds a small `DerivedIndex` interface only once a second deferred index exists. FTS5, `observation_files` and the context cache stay as they are.
 
-1. Chroma embeddings (replaces most of `ChromaSyncState`)
-2. Context cache / session rollups
-3. (Hub projection is no longer a candidate: since the Supabase cutover it happens inside the push transaction.)
-4. FTS stays on triggers. It is already synchronous and cheap, so moving it gains nothing.
-
-Raising a kind's `version` triggers a background backfill instead of a hand-written migration (compare the existing one-off `requeue*` migrations in `SessionStore.ts`).
+It isn't built in this fork because the code it rewrites (about 2,900 lines of `ChromaSync.ts`) changes upstream almost daily; a fork-only rewrite would conflict with every update (owner decision, 2026-11-28).
 
 ### Phase 3: Memory blame and path history *(done 2026-11-25; most of it already existed)*
 
@@ -100,13 +95,23 @@ What was missing, and is fixed in this PR:
 
 Not done, and worth a separate look: the `files` filter matches substrings (`LIKE %path%`), so `index.ts` matches every `index.ts`. The `observation_files` index supports exact matching; switching the `search` filter to it would be more precise and faster on large databases.
 
-### Phase 4: A thin client for ephemeral agents *(spike first)*
+### Phase 4: A thin client for ephemeral agents *(already exists; nothing to build)*
 
-Add an install mode (`CLAUDE_MEM_MODE=remote`) with no local Chroma and no full pull. Hooks POST events to the hosted server, and context injection calls the server's `context` endpoint. The only local state is a bounded, content-addressed cache of recently read observations. The spike should answer three questions: cold-start time, what happens when the server can't be reached (degrade to no injected context, never block the session), and auth for a sandbox that has no browser.
+The open-source plugin already has this as the **server runtime**:
+- `npx claude-mem install --runtime server --server-url <url>` (or the interactive "Server (beta)" choice) sets `CLAUDE_MEM_RUNTIME=server` (`src/npx-cli/commands/install.ts`).
+- Hooks send session starts, observations and summaries to the server (`src/services/hooks/runtime-selector.ts`, `src/cli/handlers/session-init.ts`), and the MCP tools query it. The MCP server never auto-starts a local worker in this mode (`src/servers/mcp-server.ts`).
+- The server is self-hostable from this repo (`src/server`, the Docker stack in `docker-compose.yml`) with API keys per team and project (`docs/public/hosted-server.mdx`). That meets decision §5.1: open source, any compatible server, URL and key as settings.
 
-### Phase 5: Superfans for claude-mem's own fleet *(ops, no product code)*
+One difference from what this phase asked for: when the server is unreachable, times out, or answers 5xx/429, hooks **fall back to the local worker** (`ServerClientError.isFallbackEligible` in `src/services/hooks/server-client.ts`) instead of skipping context. On a laptop that avoids losing memory. In a short-lived sandbox it means a server outage starts a full local worker. If that matters for your sandboxes, the change is a setting to turn the fallback off. That's an upstream design choice, so raise it there rather than in the fork.
 
-Set up scheduled Claude sessions, each owning one component: **sync hub** (the Fly forwarder's upstream errors and the Supabase function's push latency and 409 rates), **observer queue** (stuck `processing` jobs, provider errors), **installer/worker health** (PostHog crash and restart signals). Each one reports to Sid through a GitHub issue labelled `watcher` on this repo (see §5): it posts a short daily comment on the component's issue and calls out anomalies at the top. This uses existing endpoints only.
+### Phase 5: Watchers *(built 2026-11-28 as an upstream drift watcher)*
+
+The first draft had watchers for the sync hub, the observer queue and install health. The sync hub and cmem.ai belong to the upstream project, and their health data isn't available to this repo's owner, so that version would have watched nothing actionable. The owner chose an **upstream drift watcher** instead:
+- `scripts/watchers/upstream-drift.sh` reports how far this fork's `main` is behind `thedotmack/claude-mem` `main`: commits, versions, releases not yet taken, and files changed on both sides (likely merge conflicts). It's read-only.
+- A daily scheduled Claude task runs it and keeps one open GitHub issue on this repo labelled `watcher` + `watcher:upstream`, assigned to the owner, for Sid to read. It updates that issue as upstream moves and closes it once `main` catches up.
+- **Blocked until Issues are enabled on this fork.** GitHub turns Issues off for forks by default, and the first report on 2026-11-28 was refused with `410 Issues has been disabled in this repository`. Turn it on in the repo's Settings → General → Features → Issues.
+
+First run (2026-11-28): fork `main` v15.7.0 is **1,264 commits and 46 releases behind** upstream v17.0.2. No file has changed on both sides, so updating `main` should merge cleanly.
 
 ---
 
@@ -122,7 +127,13 @@ Set up scheduled Claude sessions, each owning one component: **sync hub** (the F
 1. **Thin client ships in the open-source plugin.** `CLAUDE_MEM_MODE=remote` is a normal install mode, not a Pro-only feature. It must work against any compatible server, both self-hosted `src/server` and the hosted one, so the server URL and auth are settings rather than hard-coded cmem.ai values. Pro adds the hosted endpoint only.
 2. **Background projection runs inside the existing `cmem-sync-api` Fly app.** *(Moot since Phase 1 was withdrawn: production projection happens inside the Supabase push transaction. Kept for the record.)* No new machine or process group. Phase 1 kicks projection through the in-process `user-queue.ts` and keeps the existing Postgres lease, so a second machine of the same app can't project the same user at the same time. If projection load later starts to affect push latency, the fallback is a separate Fly process group in the same app, not a new app.
 3. **Watchers report to Sid through GitHub issues.** Sid is the lead bot for the agents in the UP Command Center artifact and has no GitHub account, so the issues live on this repo under the owner's account:
-   - Each watcher opens or updates one issue per component, labelled `watcher` plus a component label (`watcher:sync-hub`, `watcher:observer-queue`, `watcher:install-health`), and assigned to the repo owner.
+   - Each watcher opens or updates one issue per component, labelled `watcher` plus a component label (today only `watcher:upstream`; see Phase 5), and assigned to the repo owner.
    - It comments on the component's existing open issue instead of opening duplicates, and closes the issue when the signal clears.
    - Sid reads open `watcher` issues as its input. A later step adds a "Watcher issues" panel to the UP Command Center that lists them, so the owner sees the same queue Sid works from. GitHub stays the single record.
    - No Slack channel and no email for now.
+
+## 6. What changed on 2026-11-28
+
+- **This repo is a fork.** `package.json` points at `thedotmack/claude-mem` (Alex Newman). The sync hub, cmem.ai and the hosted server's production deployment belong to that project. That's why Phase 5 now watches upstream drift instead of upstream's infrastructure.
+- **The fork is far behind.** `main` is v15.7.0 and upstream is v17.0.2 (1,264 commits, 46 releases). Most of this plan was researched on v15.7.0 code. Phase 2's design was redone against v17.0.2.
+- **PR #1 conflicts with upstream.** A trial merge of this branch onto upstream `main` conflicts in `src/servers/mcp-server.ts` and `tests/servers/mcp-tool-schemas.test.ts`: upstream added a `deep` search option and new tests in the same places. Upstream still doesn't expose `files` on `search`, so Phase 3's change is still useful. It needs resolving once `main` is updated, and it is a good candidate to send upstream as its own PR.
